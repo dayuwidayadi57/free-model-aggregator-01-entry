@@ -4,15 +4,21 @@
 // answers the env client's 20 requests, each with the best free model that can
 // serve it. It exits 0 the moment GET /work says the workload is done.
 //
-// Routing (the 60% quality game): every request gets the highest-rated free
-// model meeting its requirements. When a provider refuses, the error's own
-// message says why: "budget is spent" and "is out" are permanent (that provider
-// is dead for the trial); "refused this call" is one bad call number (retry the
-// same provider once, the next call almost always answers); anything else is
-// treated as transient. A provider that fails twice in a row is set aside and
-// tried last; one that fails on two separate requests is dead. Calls are
-// strictly sequential — the client sends one request at a time, and no provider
-// is ever called twice at once.
+// Routing (the 60% quality game): fresh-first with a deficit guard, then the
+// big-budget tier. An untouched provider's first call always answers, so a
+// fresh provider is tried first — but only when its best model is close to
+// the request's best (weighted deficit at most 55 milli). Past that, the
+// request falls back to a provider already in use, big budgets first
+// (kilol, pollinations, openrouter, groq) with load spread over the tier by
+// fewest calls. When a provider refuses, the error's own message says why:
+// "budget is spent" and "is out" are permanent (that provider is dead for
+// the trial); "refused this call" is one bad call number (retry the same
+// provider once, the next call almost always answers); anything else is
+// treated as transient. A provider that fails twice in a row is set aside
+// and tried last; one that fails on two separate requests is dead. Calls are
+// strictly sequential — the client sends one request at a time, and no
+// provider is ever called twice at once. There is no flat cap: a provider
+// with many calls is still tried, just after its less-used big-tier peers.
 //
 // Determinism: every choice is a function of the brief, the requests and the
 // providers' answers so far. No wall clock, no unseeded randomness, no parallel
@@ -39,6 +45,7 @@ import {
   type RatingRow,
   type Requirement,
   type Wire,
+  type WorkloadRequest,
 } from './lib/providers.ts';
 import {
   anthropicError,
@@ -117,15 +124,55 @@ function listedOf(providerId: string, modelId: string): ListedModel | null {
 }
 
 /**
- * Every (provider, model) that may serve one request, best first: free, meeting
- * the requirements, and — for an OpenAI JSON-mode request — on a wire that can
- * carry JSON mode (Anthropic's wire cannot). Dead providers sink to the end,
- * suspect ones after the healthy, and equal ratings spread over the providers
- * with the fewest calls so far. Ties break on provider then model id, so the
- * order is the same on every replay.
+ * Routing (the 60% quality game): fresh-first with a deficit guard, then the
+ * big-budget tier.
+ *
+ * A provider's FIRST call always answers (a refusal only ever strikes call
+ * 2..budget-1), so an untouched provider is a guaranteed success — but only
+ * worth spending when its best eligible model is close to the request's best:
+ * weighted deficit (weight x best-minus-rating) at most 55 milli. Past that,
+ * the request goes to a provider already in use, where the big-budget tier
+ * (kilol, pollinations, openrouter, groq — the largest free budgets in the
+ * kit's provider table) comes first and load spreads over it by fewest calls,
+ * so no one provider is driven deep into its failing call numbers. Smaller
+ * used providers follow by budget rank; untouched providers past the guard
+ * and dead providers are the last resort, best rating first.
+ *
+ * One candidate per provider (its best eligible model): a second model on a
+ * provider that just failed twice would only spend another call for a worse
+ * rating. No flat cap anywhere — a provider with many calls is still tried,
+ * just after its less-used big-tier peers.
  */
-function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic', jsonMode: boolean): Candidate[] {
-  const out: Candidate[] = [];
+const DEFICIT_GUARD_MILLI = 55;
+/** Largest free budgets first; the first four are the fallback tier. */
+const BUDGET_ORDER = [
+  'kilol',
+  'pollinations',
+  'openrouter',
+  'groq',
+  'cloudflare',
+  'gemini',
+  'ovh',
+  'cerebras',
+  'zai',
+  'sambanova',
+];
+const BIG_BUDGET_TIER = 4;
+
+function budgetRank(providerId: string): number {
+  const rank = BUDGET_ORDER.indexOf(providerId);
+  return rank === -1 ? BUDGET_ORDER.length : rank;
+}
+
+function candidatesFor(
+  entry: WorkloadRequest | null,
+  requires: Requirement,
+  clientApi: 'openai' | 'anthropic',
+  jsonMode: boolean,
+): Candidate[] {
+  // Best eligible model per provider; the rest of a provider's rows never
+  // serve better than its best.
+  const bestByProvider = new Map<string, Candidate>();
   for (const provider of brief.directory) {
     if (jsonMode && clientApi === 'openai' && provider.wire === 'anthropic') continue;
     for (const row of brief.ratings) {
@@ -137,20 +184,65 @@ function candidatesFor(requires: Requirement, clientApi: 'openai' | 'anthropic',
       );
       if (!meetsRequirements(requires, caps)) continue;
       if (stateOf(provider.id).badModels.has(row.model)) continue;
-      out.push({ provider, model: row, rating: row.rating_milli });
+      const prev = bestByProvider.get(provider.id);
+      if (
+        prev === undefined ||
+        row.rating_milli > prev.rating ||
+        (row.rating_milli === prev.rating && row.model < prev.model.model)
+      ) {
+        bestByProvider.set(provider.id, { provider, model: row, rating: row.rating_milli });
+      }
     }
   }
-  out.sort((a, b) => {
+  const rows = [...bestByProvider.values()];
+  // The request's best rating from the sealed table (the manifest always
+  // carries it); else the best eligible row.
+  const tableBest = entry === null
+    ? 0
+    : (brief.best.find((b) => b.id === entry.id)?.rating_milli ?? 0);
+  const top = tableBest > 0 ? tableBest : rows.reduce((m, c) => Math.max(m, c.rating), 0);
+  const weight = entry?.weight ?? 1;
+  const deficitOf = (c: Candidate): number => weight * (top - c.rating);
+  const byRating = (a: Candidate, b: Candidate): number =>
+    b.rating - a.rating ||
+    (a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0) ||
+    (a.model.model < b.model.model ? -1 : a.model.model > b.model.model ? 1 : 0);
+  const freshOk: Candidate[] = [];
+  const usedBig: Candidate[] = [];
+  const usedSmall: Candidate[] = [];
+  const freshFar: Candidate[] = [];
+  const dead: Candidate[] = [];
+  for (const c of rows) {
+    const s = stateOf(c.provider.id);
+    if (s.dead) {
+      dead.push(c);
+    } else if (s.calls === 0) {
+      (deficitOf(c) <= DEFICIT_GUARD_MILLI ? freshOk : freshFar).push(c);
+    } else if (budgetRank(c.provider.id) < BIG_BUDGET_TIER) {
+      usedBig.push(c);
+    } else {
+      usedSmall.push(c);
+    }
+  }
+  freshOk.sort(byRating);
+  freshFar.sort(byRating);
+  dead.sort(byRating);
+  usedBig.sort((a, b) => {
     const sa = stateOf(a.provider.id);
     const sb = stateOf(b.provider.id);
-    if (sa.dead !== sb.dead) return sa.dead ? 1 : -1;
     if (sa.suspect !== sb.suspect) return sa.suspect ? 1 : -1;
-    if (a.rating !== b.rating) return b.rating - a.rating;
     if (sa.calls !== sb.calls) return sa.calls - sb.calls;
-    if (a.provider.id !== b.provider.id) return a.provider.id < b.provider.id ? -1 : 1;
-    return a.model.model < b.model.model ? -1 : a.model.model > b.model.model ? 1 : 0;
+    return byRating(a, b);
   });
-  return out;
+  usedSmall.sort((a, b) => {
+    const sa = stateOf(a.provider.id);
+    const sb = stateOf(b.provider.id);
+    if (sa.suspect !== sb.suspect) return sa.suspect ? 1 : -1;
+    if (budgetRank(a.provider.id) !== budgetRank(b.provider.id))
+      return budgetRank(a.provider.id) - budgetRank(b.provider.id);
+    return byRating(a, b);
+  });
+  return [...freshOk, ...usedBig, ...usedSmall, ...freshFar, ...dead];
 }
 
 // ---- the failure's own message says whether it is permanent ----
@@ -349,9 +441,10 @@ async function serve(
   clientApi: 'openai' | 'anthropic',
   body: Json,
 ): Promise<Served | null> {
+  const entry = brief.workload[manifestIndex] ?? null;
   const requires = requirementsFor(body);
   const jsonMode = jsonModeOf(clientApi, body);
-  const candidates = candidatesFor(requires, clientApi, jsonMode);
+  const candidates = candidatesFor(entry, requires, clientApi, jsonMode);
   for (const candidate of candidates) {
     const state = stateOf(candidate.provider.id);
     let failedThisRequest = false;
